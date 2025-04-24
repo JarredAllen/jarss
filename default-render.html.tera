@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<body> <ul>
+  {% for article in articles %}
+    <li>
+      {{ article.publish_date }} {{article.site}} <br /> <a href="{{ article.link }}">{{ article.title }}</a>
+    </li>
+  {% endfor %}
+</ul> </body>
