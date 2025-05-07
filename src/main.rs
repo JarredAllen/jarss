@@ -80,6 +80,7 @@ impl TryFrom<Args> for InferredArgs {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args: InferredArgs = Args::parse().try_into()?;
+    log::info!("Loading config from {}", args.config.display());
     let config = load_config(&args.config).with_context(|| {
         format!(
             "Couldn't load configuraion file at {}",
@@ -145,6 +146,7 @@ fn main() -> anyhow::Result<()> {
     articles.sort_unstable_by_key(|article| std::cmp::Reverse(article.published));
 
     // Generate HTML output
+    log::info!("Generating feed output at {}", args.out_html.display());
     let mut tera = tera::Tera::default();
     tera.add_raw_template("output", &args.feed_template)
         .context("Error parsing tera template")?;
