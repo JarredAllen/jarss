@@ -94,8 +94,8 @@ fn main() -> anyhow::Result<()> {
         ureq::config::Config::builder()
             .user_agent(USER_AGENT)
             .http_status_as_error(false)
-            .timeout_per_call(Some(Duration::from_secs(5)))
-            .timeout_global(Some(Duration::from_secs(10)))
+            .timeout_per_call(Some(Duration::from_secs(20)))
+            .timeout_global(Some(Duration::from_secs(40)))
             .build(),
     );
     for site in &config.sites {
