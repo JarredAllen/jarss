@@ -3,6 +3,7 @@ use clap::Parser;
 use std::{
     fs::File,
     path::{Path, PathBuf},
+    process::ExitCode,
     time::Duration,
 };
 
@@ -77,7 +78,7 @@ impl TryFrom<Args> for InferredArgs {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     env_logger::init();
     let args: InferredArgs = Args::parse().try_into()?;
     log::info!("Loading config from {}", args.config.display());
@@ -88,6 +89,8 @@ fn main() -> anyhow::Result<()> {
         )
     })?;
     let mut caches = cache::CacheManager::new(args.cache);
+
+    let mut error_update = false;
 
     // Fetch the feeds to check for updates
     let http_agent = ureq::Agent::new_with_config(
@@ -102,7 +105,16 @@ fn main() -> anyhow::Result<()> {
         let cache = caches
             .get_mut(site)
             .with_context(|| format!("Error reading cache for {}", site.name))?;
-        cache::query_site(&http_agent, &config, site, cache).context("Error fetching feed")?;
+        if let Err(e) = cache::query_site(&http_agent, &config, site, cache) {
+            log::error!(
+                "{:?}",
+                e.context(format!(
+                    "Error fetching feed {} from url {}",
+                    site.name, site.feed_url
+                ))
+            );
+            error_update = true;
+        }
     }
     caches.save().context("Error saving caches")?;
 
@@ -159,7 +171,11 @@ fn main() -> anyhow::Result<()> {
     )
     .context("Failed to write to output file")?;
 
-    Ok(())
+    Ok(if error_update {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
