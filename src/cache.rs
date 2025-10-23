@@ -3,13 +3,13 @@ use super::{Config, SiteConfig};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
-    fs::File,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
+use tokio::fs::File;
 
-pub fn query_site(
-    agent: &ureq::Agent,
+pub async fn query_site(
+    agent: &reqwest::Client,
     config: &Config,
     site: &SiteConfig,
     cache: &mut SiteCache,
@@ -60,7 +60,7 @@ pub fn query_site(
         }
     }
     log::debug!("Sending request {req:?}");
-    let mut res = req.call().context("Error fetching feed")?;
+    let res = req.send().await.context("Error fetching feed")?;
     match res.status() {
         http::status::StatusCode::OK => {
             log::info!("New content from {}", site.name);
@@ -81,8 +81,8 @@ pub fn query_site(
                     .context("Error parsing HTTP headers")?,
             );
             cache.last_body = Some(
-                res.body_mut()
-                    .read_to_string()
+                res.text()
+                    .await
                     .context("Failed to read feed contents")?
                     .into_boxed_str(),
             );
@@ -129,11 +129,11 @@ impl CacheManager {
         }
     }
 
-    pub fn get_mut(&mut self, index: &SiteConfig) -> Result<&mut SiteCache> {
+    pub async fn get_mut(&mut self, index: &SiteConfig) -> Result<&mut SiteCache> {
         match self.caches.entry(index.name.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let cache = SiteCache::load_for_site(&self.cache_dir, index)?;
+                let cache = SiteCache::load_for_site(&self.cache_dir, index).await?;
                 Ok(entry.insert(cache))
             }
         }
@@ -149,11 +149,19 @@ impl CacheManager {
         })
     }
 
-    pub fn save(&self) -> Result<()> {
+    pub async fn save(&self) -> Result<()> {
+        use futures::StreamExt as _;
+        let mut saves = futures::stream::FuturesUnordered::new();
         for (site, cache) in self.caches.iter() {
-            cache
-                .save_for_site(&self.cache_dir, site)
-                .with_context(|| format!("Failed to save cache for {}", site))?;
+            saves.push(async move {
+                cache
+                    .save_for_site(&self.cache_dir, site)
+                    .await
+                    .with_context(|| format!("Failed to save cache for {}", site))
+            });
+        }
+        while let Some(res) = saves.next().await {
+            res?;
         }
         Ok(())
     }
@@ -172,16 +180,19 @@ pub struct SiteCache {
 }
 impl SiteCache {
     /// Load the cache entry for the given site.
-    fn load_for_site(cache_dir: impl AsRef<Path>, config: &SiteConfig) -> Result<Self> {
+    async fn load_for_site(cache_dir: impl AsRef<Path>, config: &SiteConfig) -> Result<Self> {
         let path = cache_dir
             .as_ref()
             .join(Self::cache_file_for_name(&config.name));
-        match File::open(&path) {
-            Ok(file) => {
+        match File::open(&path).await {
+            Ok(mut file) => {
+                use tokio::io::AsyncReadExt as _;
                 let postcard_encoded = {
                     use std::io::Read;
+                    let mut compressed = Vec::new();
+                    file.read_to_end(&mut compressed).await?;
                     let mut encoded = Vec::new();
-                    lz4_flex::frame::FrameDecoder::new(file)
+                    lz4_flex::frame::FrameDecoder::new(std::io::Cursor::new(compressed))
                         .read_to_end(&mut encoded)
                         .context("Failed to read cache file")?;
                     encoded
@@ -199,16 +210,26 @@ impl SiteCache {
     }
 
     /// Save the cache entry for the given site.
-    fn save_for_site(&self, cache_dir: impl AsRef<Path>, site_name: &str) -> Result<()> {
+    async fn save_for_site(&self, cache_dir: impl AsRef<Path>, site_name: &str) -> Result<()> {
+        use std::io::Write as _;
+        use tokio::io::AsyncWriteExt as _;
+
         let _ = std::fs::create_dir_all(&cache_dir);
         let path = cache_dir
             .as_ref()
             .join(Self::cache_file_for_name(site_name));
-        let mut out_file = lz4_flex::frame::FrameEncoder::new(
-            File::create(&path).context("Error opening cache dir for writing")?,
-        );
-        postcard::to_io(self, &mut out_file).context("Error writing out cache")?;
-        out_file.finish().context("Error writing out cache")?;
+        let encoded = postcard::to_stdvec(self).context("Error writing out cache")?;
+        let compressed = {
+            let mut lz4 = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            lz4.write_all(&encoded)?;
+            lz4.finish()?
+        };
+        File::create(&path)
+            .await
+            .context("Error opening cache dir for writing")?
+            .write_all(&compressed)
+            .await
+            .context("Error writing out cache")?;
         Ok(())
     }
 

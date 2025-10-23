@@ -78,11 +78,12 @@ impl TryFrom<Args> for InferredArgs {
     }
 }
 
-fn main() -> anyhow::Result<ExitCode> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<ExitCode> {
     env_logger::init();
     let args: InferredArgs = Args::parse().try_into()?;
     log::info!("Loading config from {}", args.config.display());
-    let config = load_config(&args.config).with_context(|| {
+    let config = load_config(&args.config).await.with_context(|| {
         format!(
             "Couldn't load configuraion file at {}",
             args.config.display()
@@ -93,19 +94,17 @@ fn main() -> anyhow::Result<ExitCode> {
     let mut error_update = false;
 
     // Fetch the feeds to check for updates
-    let http_agent = ureq::Agent::new_with_config(
-        ureq::config::Config::builder()
-            .user_agent(USER_AGENT)
-            .http_status_as_error(false)
-            .timeout_per_call(Some(Duration::from_secs(20)))
-            .timeout_global(Some(Duration::from_secs(40)))
-            .build(),
-    );
+    let http_client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .read_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(40))
+        .build()?;
     for site in &config.sites {
         let cache = caches
             .get_mut(site)
+            .await
             .with_context(|| format!("Error reading cache for {}", site.name))?;
-        if let Err(e) = cache::query_site(&http_agent, &config, site, cache) {
+        if let Err(e) = cache::query_site(&http_client, &config, site, cache).await {
             log::error!(
                 "{:?}",
                 e.context(format!(
@@ -116,7 +115,7 @@ fn main() -> anyhow::Result<ExitCode> {
             error_update = true;
         }
     }
-    caches.save().context("Error saving caches")?;
+    caches.save().await.context("Error saving caches")?;
 
     // Parse the articles and grab the most recent ones
     let mut articles = Vec::new();
@@ -234,8 +233,10 @@ struct SiteConfig {
 }
 
 /// Load the config from the given path.
-fn load_config(path: impl AsRef<Path>) -> Result<Config> {
-    let contents = std::fs::read_to_string(path).context("Failed to read config file")?;
+async fn load_config(path: impl AsRef<Path>) -> Result<Config> {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .context("Failed to read config file")?;
     toml::de::from_str(&contents).context("Failed to parse config file")
 }
 
