@@ -1,12 +1,13 @@
 use super::{Config, SiteConfig};
 
 use anyhow::{Context, Result};
+use futures::Stream;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-use tokio::fs::File;
+use tokio::{fs::File, sync::Mutex};
 
 pub async fn query_site(
     agent: &reqwest::Client,
@@ -119,42 +120,63 @@ pub async fn query_site(
 
 pub struct CacheManager {
     cache_dir: PathBuf,
-    caches: HashMap<Box<str>, SiteCache>,
+    caches: papaya::HashMap<Box<str>, Mutex<SiteCache>>,
 }
 impl CacheManager {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir,
-            caches: HashMap::new(),
+            caches: papaya::HashMap::new(),
         }
     }
 
-    pub async fn get_mut(&mut self, index: &SiteConfig) -> Result<&mut SiteCache> {
-        match self.caches.entry(index.name.clone()) {
-            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let cache = SiteCache::load_for_site(&self.cache_dir, index).await?;
-                Ok(entry.insert(cache))
-            }
+    /// Return a guard for some operations that require it.
+    pub fn cache_guard(&self) -> papaya::LocalGuard<'_> {
+        self.caches.guard()
+    }
+
+    pub async fn get_mut<'a>(
+        &self,
+        index: &SiteConfig,
+        guard: &'a papaya::LocalGuard<'a>,
+    ) -> Result<impl std::ops::DerefMut<Target = SiteCache> + use<'_, 'a>> {
+        if let Some(entry) = self.caches.get(&index.name, guard) {
+            Ok(entry.lock().await)
+        } else {
+            let cache = SiteCache::load_for_site(&self.cache_dir, index).await?;
+            let entry = self
+                .caches
+                .try_insert(index.name.clone(), Mutex::new(cache), guard)
+                .unwrap();
+            Ok(entry.lock().await)
         }
     }
 
-    pub fn feeds(&self) -> impl Iterator<Item = (&'_ str, Result<feed_rs::model::Feed>)> {
-        self.caches.iter().filter_map(|(site, cache)| {
+    pub fn feeds<'a>(
+        &self,
+        guard: &'a papaya::LocalGuard<'a>,
+    ) -> impl Stream<Item = (&'a str, Result<feed_rs::model::Feed>)> + use<'_, 'a> {
+        use futures::StreamExt as _;
+        futures::stream::iter(self.caches.iter(guard)).filter_map(async move |(site, cache)| {
             Some((
                 site.as_ref(),
-                feed_rs::parser::parse(std::io::Cursor::new(cache.last_body.as_ref()?.as_bytes()))
-                    .map_err(anyhow::Error::from),
+                feed_rs::parser::parse(std::io::Cursor::new(
+                    cache.lock().await.last_body.as_ref()?.as_bytes(),
+                ))
+                .map_err(anyhow::Error::from),
             ))
         })
     }
 
     pub async fn save(&self) -> Result<()> {
         use futures::StreamExt as _;
+        let caches = self.caches.pin();
         let mut saves = futures::stream::FuturesUnordered::new();
-        for (site, cache) in self.caches.iter() {
+        for (site, cache) in caches.iter() {
             saves.push(async move {
                 cache
+                    .lock()
+                    .await
                     .save_for_site(&self.cache_dir, site)
                     .await
                     .with_context(|| format!("Failed to save cache for {}", site))

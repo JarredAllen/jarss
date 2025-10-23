@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use futures::StreamExt as _;
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -89,7 +90,7 @@ async fn main() -> anyhow::Result<ExitCode> {
             args.config.display()
         )
     })?;
-    let mut caches = cache::CacheManager::new(args.cache);
+    let caches = cache::CacheManager::new(args.cache);
 
     let mut error_update = false;
 
@@ -99,27 +100,39 @@ async fn main() -> anyhow::Result<ExitCode> {
         .read_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(40))
         .build()?;
+
+    let fetch_guard = caches.cache_guard();
+    let mut fetches = futures::stream::FuturesUnordered::new();
     for site in &config.sites {
-        let cache = caches
-            .get_mut(site)
-            .await
-            .with_context(|| format!("Error reading cache for {}", site.name))?;
-        if let Err(e) = cache::query_site(&http_client, &config, site, cache).await {
-            log::error!(
-                "{:?}",
-                e.context(format!(
+        fetches.push(async {
+            let mut cache = caches
+                .get_mut(site, &fetch_guard)
+                .await
+                .with_context(|| format!("Error reading cache for {}", site.name))?;
+            cache::query_site(&http_client, &config, site, &mut cache)
+                .await
+                .context(format!(
                     "Error fetching feed {} from url {}",
                     site.name, site.feed_url
-                ))
-            );
+                ))?;
+            anyhow::Ok(())
+        });
+    }
+    while let Some(res) = fetches.next().await {
+        if let Err(e) = res {
+            log::error!("{:?}", e);
             error_update = true;
         }
     }
+    drop(fetches);
+    drop(fetch_guard);
     caches.save().await.context("Error saving caches")?;
 
     // Parse the articles and grab the most recent ones
     let mut articles = Vec::new();
-    for (site_name, feed) in caches.feeds() {
+    let feed_guard = caches.cache_guard();
+    let mut feeds = std::pin::pin!(caches.feeds(&feed_guard));
+    while let Some((site_name, feed)) = feeds.next().await {
         let mut feed = match feed {
             Ok(feed) => feed,
             Err(e) => {
